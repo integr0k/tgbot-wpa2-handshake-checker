@@ -1,0 +1,11 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+bot.db
+found_password.txt
+downloads/
+CACHEDIR.TAG
