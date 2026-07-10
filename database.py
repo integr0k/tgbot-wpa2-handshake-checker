@@ -186,27 +186,35 @@ def record_admin_file(admin_id: int, filename: str, file_id: Optional[str], file
         conn.commit()
 
 
-    def record_current_process(admin_id: int, pid: int, hc22000_path: str) -> None:
-        with closing(get_connection()) as conn:
-            conn.execute(
-                "INSERT INTO running_processes (admin_id, pid, hc22000_path) VALUES (?, ?, ?)",
-                (admin_id, pid, hc22000_path),
-            )
-            conn.commit()
+def record_current_process(admin_id: int, pid: int, hc22000_path: str) -> None:
+    with closing(get_connection()) as conn:
+        conn.execute(
+            "INSERT INTO running_processes (admin_id, pid, hc22000_path) VALUES (?, ?, ?)",
+            (admin_id, pid, hc22000_path),
+        )
+        conn.commit()
 
 
-    def get_current_process(admin_id: int):
-        with closing(get_connection()) as conn:
-            return conn.execute(
-                "SELECT id, pid, hc22000_path, started_at FROM running_processes WHERE admin_id = ? ORDER BY id DESC LIMIT 1",
-                (admin_id,),
-            ).fetchone()
+def get_current_process(admin_id: int):
+    with closing(get_connection()) as conn:
+        return conn.execute(
+            "SELECT id, pid, hc22000_path, started_at FROM running_processes WHERE admin_id = ? ORDER BY id DESC LIMIT 1",
+            (admin_id,),
+        ).fetchone()
 
 
-    def clear_current_process(admin_id: int) -> None:
-        with closing(get_connection()) as conn:
-            conn.execute("DELETE FROM running_processes WHERE admin_id = ?", (admin_id,))
-            conn.commit()
+def clear_current_process(admin_id: int) -> None:
+    with closing(get_connection()) as conn:
+        conn.execute("DELETE FROM running_processes WHERE admin_id = ?", (admin_id,))
+        conn.commit()
+
+
+def get_admin_by_telegram_id(telegram_user_id: int) -> Optional[sqlite3.Row]:
+    with closing(get_connection()) as conn:
+        return conn.execute(
+            "SELECT * FROM admins WHERE telegram_user_id = ?",
+            (telegram_user_id,),
+        ).fetchone()
 
 
 def record_found_password(admin_id: int, password: str, source_file: str) -> None:

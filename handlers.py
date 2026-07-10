@@ -2,32 +2,39 @@ import asyncio
 import os
 import shutil
 import signal
-from typing import Optional
+from dataclasses import dataclass
+from typing import Optional, Dict
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup
 
-from config import ADMIN_USERNAME, DOWNLOADS_DIR, OUTFILE_PATH, WORDLIST_PATH
+from config import DOWNLOADS_DIR, OUTFILE_PATH, WORDLIST_PATH
 from database import (
     authenticate_admin,
     clear_authorization,
     create_admin,
     ensure_default_admin,
-    get_admin_by_username,
+    get_admin_by_telegram_id,
     get_admin_files,
     get_found_passwords,
     is_authorized,
     record_admin_file,
     record_found_password,
     record_current_process,
-    get_current_process,
     clear_current_process,
 )
 import psutil
 
-current_process = None
-current_pid = None
+@dataclass
+class ProcessState:
+    process: asyncio.subprocess.Process
+    pid: int
+    hc22000_path: str
+    admin_id: int
+    chat_id: int
+
+process_states: Dict[int, ProcessState] = {}
 
 
 def get_reply_keyboard() -> ReplyKeyboardMarkup:
@@ -46,6 +53,50 @@ def get_control_keyboard() -> InlineKeyboardMarkup:
         ],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def is_pid_running(pid: int) -> bool:
+    try:
+        proc = psutil.Process(pid)
+        return proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        return False
+
+
+def get_active_state(telegram_user_id: int) -> Optional[ProcessState]:
+    state = process_states.get(telegram_user_id)
+    if state and state.process.returncode is None:
+        return state
+    return None
+
+
+async def monitor_hashcat_process(telegram_user_id: int, bot: Bot) -> None:
+    state = process_states.get(telegram_user_id)
+    if not state:
+        return
+
+    process = state.process
+    await process.communicate()
+    process_states.pop(telegram_user_id, None)
+    clear_current_process(state.admin_id)
+
+    if process.returncode == 0 and os.path.exists(OUTFILE_PATH) and os.path.getsize(OUTFILE_PATH) > 0:
+        with open(OUTFILE_PATH, "r", encoding="utf-8") as f:
+            result = f.read().strip()
+        try:
+            record_found_password(state.admin_id, result, str(OUTFILE_PATH))
+        except Exception:
+            pass
+        await bot.send_message(
+            state.chat_id,
+            f"🎉 <b>SUCCESS!</b> Password found:\n<code>{result}</code>",
+            parse_mode="HTML",
+        )
+    else:
+        await bot.send_message(
+            state.chat_id,
+            "🔎 Hashcat finished. No password was recovered from this task.",
+        )
 
 
 async def require_admin(message: Message) -> bool:
@@ -108,7 +159,7 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
     async def cmd_history(message: Message):
         if not await require_admin(message):
             return
-        admin = get_admin_by_username(ADMIN_USERNAME)
+        admin = get_admin_by_telegram_id(message.from_user.id)
         if not admin:
             await message.answer("Admin not found")
             return
@@ -137,13 +188,12 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
 
     @dp.message(F.document & F.document.file_name.lower().endswith((".cap", ".pcap")))
     async def handle_handshake_document(message: Message):
-        global current_process, current_pid
-
         if not await require_admin(message):
             return
 
-        if current_process and current_process.returncode is None:
-            await message.answer("⚠️ Error: A cracking process is already running on the server. Stop it before starting a new one.")
+        existing_state = get_active_state(message.from_user.id)
+        if existing_state:
+            await message.answer("⚠️ Error: A cracking process is already running on your account. Stop it before starting a new one.")
             return
 
         if not shutil.which("hcxpcapngtool"):
@@ -160,7 +210,7 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
         cap_path = os.path.join(DOWNLOADS_DIR, document.file_name)
         await bot.download_file(file_path=file_info.file_path, destination=cap_path)
 
-        admin = get_admin_by_username(ADMIN_USERNAME)
+        admin = get_admin_by_telegram_id(message.from_user.id)
         if admin:
             record_admin_file(admin["id"], document.file_name, document.file_id, cap_path)
 
@@ -186,7 +236,7 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
         if os.path.exists(OUTFILE_PATH):
             os.remove(OUTFILE_PATH)
 
-        current_process = await asyncio.create_subprocess_exec(
+        hashcat_proc = await asyncio.create_subprocess_exec(
             "hashcat",
             "-m",
             "22000",
@@ -204,46 +254,45 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        current_pid = current_process.pid
-        try:
-            admin = get_admin_by_username(ADMIN_USERNAME)
-            if admin:
-                record_current_process(admin["id"], current_pid, str(hc22000_path))
-        except Exception:
-            pass
+        if not admin:
+            await message.answer("⚠️ Failed to locate admin info after authentication.")
+            return
+
+        state = ProcessState(
+            process=hashcat_proc,
+            pid=hashcat_proc.pid,
+            hc22000_path=str(hc22000_path),
+            admin_id=admin["id"],
+            chat_id=message.chat.id,
+        )
+        process_states[message.from_user.id] = state
+        record_current_process(admin["id"], state.pid, state.hc22000_path)
+
+        asyncio.create_task(monitor_hashcat_process(message.from_user.id, bot))
 
         await message.answer(
-            text=f"🚀 Brute-force started successfully in the background!\nProcess PID: <code>{current_pid}</code>\nUse the control buttons below:",
+            text=f"🚀 Brute-force started successfully in the background!\nProcess PID: <code>{state.pid}</code>\nUse the control buttons below:",
             parse_mode="HTML",
             reply_markup=get_control_keyboard(),
         )
 
     @dp.callback_query(F.data.startswith("brute_"))
     async def handle_callbacks(callback: CallbackQuery):
-        global current_process, current_pid
         action = callback.data.split("_")[1]
 
-        admin = get_admin_by_username(ADMIN_USERNAME)
-        if (not current_process or getattr(current_process, "returncode", None) is not None):
-            current_pid_db = None
-            if admin:
-                row = get_current_process(admin["id"])
-                if row:
-                    current_pid_db = row["pid"]
-            if current_pid_db:
-                current_pid = current_pid_db
-            else:
-                await callback.answer("The cracking process is not running or has already finished!", show_alert=True)
-                return
+        state = get_active_state(callback.from_user.id)
+        if not state:
+            await callback.answer("The cracking process is not running or has already finished!", show_alert=True)
+            return
 
         if action == "pause":
             try:
-                p = psutil.Process(current_pid)
+                p = psutil.Process(state.pid)
                 p.suspend()
                 await callback.message.answer("Brute-force paused. The GPU is now idle.")
             except Exception:
                 try:
-                    os.kill(current_pid, signal.SIGSTOP)
+                    os.kill(state.pid, signal.SIGSTOP)
                     await callback.message.answer("Brute-force paused. The GPU is now idle.")
                 except Exception:
                     await callback.answer("Failed to pause process.", show_alert=True)
@@ -251,12 +300,12 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
 
         elif action == "resume":
             try:
-                p = psutil.Process(current_pid)
+                p = psutil.Process(state.pid)
                 p.resume()
                 await callback.message.answer("Brute-force resumed successfully on the GPU!")
             except Exception:
                 try:
-                    os.kill(current_pid, signal.SIGCONT)
+                    os.kill(state.pid, signal.SIGCONT)
                     await callback.message.answer("Brute-force resumed successfully on the GPU!")
                 except Exception:
                     await callback.answer("Failed to resume process.", show_alert=True)
@@ -265,37 +314,34 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
         elif action == "stop":
             stopped = False
             try:
-                p = psutil.Process(current_pid)
+                p = psutil.Process(state.pid)
                 p.terminate()
                 p.wait(timeout=10)
                 stopped = True
             except Exception:
                 try:
-                    os.kill(current_pid, signal.SIGTERM)
+                    os.kill(state.pid, signal.SIGTERM)
                     stopped = True
                 except Exception:
                     stopped = False
-            try:
-                if admin:
-                    clear_current_process(admin["id"])
-            except Exception:
-                pass
             if stopped:
+                process_states.pop(callback.from_user.id, None)
+                clear_current_process(state.admin_id)
                 await callback.message.answer("Brute-force stopped. A recovery checkpoint may have been created.")
             else:
                 await callback.answer("Failed to stop process.", show_alert=True)
             await callback.answer()
 
         elif action == "status":
-            if os.path.exists(OUTFILE_PATH) and os.path.getsize(OUTFILE_PATH) > 0:
+            is_running = state.process.returncode is None and is_pid_running(state.pid)
+            if is_running:
+                await callback.message.answer(f"📊 The process is still running (PID {state.pid}).")
+            elif os.path.exists(OUTFILE_PATH) and os.path.getsize(OUTFILE_PATH) > 0:
                 with open(OUTFILE_PATH, "r", encoding="utf-8") as f:
                     res = f.read().strip()
-                admin = get_admin_by_username(ADMIN_USERNAME)
-                if admin:
-                    record_found_password(admin["id"], res, str(OUTFILE_PATH))
-                await callback.message.answer(f"🎉 <b>BINGO! PASSWORD FOUND:</b>\n<code>{res}</code>", parse_mode="HTML")
+                await callback.message.answer(f"🎉 <b>PASSWORD FOUND:</b>\n<code>{res}</code>", parse_mode="HTML")
             else:
-                await callback.message.answer("📊 The password has not been found yet. Brute-force is still running in the background.")
+                await callback.message.answer("📊 The password has not been found yet. The process is not currently active.")
             await callback.answer()
 
     @dp.message(F.document)
